@@ -1,0 +1,217 @@
+(module grammar-app.check)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use [from-cstr to-cstr concat])
+(import "coil.mem" :use [copy])
+(import "coil.os" :as os)
+(import "coil.fs" :as fs)
+(import "coil.subprocess" :as sp)
+(import "coil.time" :as time)
+(import "coil.cancellation" :as cancellation)
+(import "coil.scratch" :as scratch)
+(import "coil.serde" :use *)
+(import "coil.serde.derive" :use *)
+(import "coil.serde.json" :use *)
+
+;;; Running the `grammar` CLI (this repository's bin/grammar, found on PATH) on a
+;;; text and locating its reports in an NSString.
+
+(extern mkstemp :cc c [(ptr i8)] (-> i32))
+
+(extern unlink :cc c [(ptr i8)] (-> i32))
+
+;;; One error as `grammar --json` prints it; offsets count Unicode code points.
+(defstruct RawIssue
+  [(original (slice u8))
+   (suggestion (slice u8))
+   (kind (slice u8))
+   (explanation (slice u8))
+   (start i64)
+   (end i64)])
+
+(derive Deserialize RawIssue)
+
+;;; One error located in the text view: `start`/`end` are UTF-16 offsets
+;;; (NSString indices), the strings live in the owning Job's arena.
+(defstruct Issue
+  [(start i64)
+   (end i64)
+   (original (slice u8))
+   (suggestion (slice u8))
+   (kind (slice u8))
+   (explanation (slice u8))])
+
+(defsum Outcome
+  (Found [(issues (ArrayList Issue))])
+  (Failed [(message (slice u8)) (detail (slice u8))]))
+
+;;; One check: the text as it was sent, the edit generation it belongs to, and
+;;; what came back. Everything it allocates lives in its arena.
+(defstruct Job
+  [(arena scratch/ScratchArena)
+   (text (slice u8))
+   (generation i64)
+   (outcome Outcome)])
+
+(defn job-allocator [(job (ptr Job))] (-> (dyn Allocator))
+  (allocator (field job arena)))
+
+;;; A new job holding a copy of `text`.
+(defn job-new [(text (slice u8)) (generation i64)] (-> (ptr Job))
+  (let [job (box! (malloc-allocator) Job (zeroed Job))]
+    (scratch/ScratchArena::init (field job arena) (malloc-allocator))
+    (let [owned
+            (match (alloc [u8] (job-allocator job) (len text))
+              (Some [bytes] bytes)
+              (None [] (panic "out of memory copying the text to check")))]
+      (copy (data owned) (data text) (len text))
+      (set! (.text job) owned)
+      (set! (.generation job) generation)
+      (set! (.outcome job) (Failed "not checked yet" ""))
+      job)))
+
+(defn job-free [(job (ptr Job))] (-> i64)
+  (close! (field job arena))
+  (destroy (malloc-allocator) job))
+
+(defn failed [(message (slice u8)) (detail (slice u8))] (-> Outcome)
+  (Failed message detail))
+
+;;; The first non-blank line of `s`, for a one-line status message.
+(defn first-line [(s (slice u8))] (-> (slice u8))
+  (let [n (len s)
+        (mut start) 0]
+    (while (and (< (load start) n)
+                (let [b (primitive/cast i64 (get s (load start)))]
+                  (or (= b #\newline) (= b #\space) (= b #\return))))
+      (set! start (+ (load start) 1)))
+    (let [(mut end) (load start)]
+      (while (and (< (load end) n)
+                  (!= (primitive/cast i64 (get s (load end))) #\newline))
+        (set! end (+ (load end) 1)))
+      (subslice s (load start) (load end)))))
+
+;;; `utf16[k]` is the UTF-16 offset where code point k of the UTF-8 `text`
+;;; begins; the last entry is the text's UTF-16 length.
+(defn utf16-offsets [(a (dyn Allocator)) (text (slice u8))] (-> (ArrayList i64))
+  (let [(mut offsets) (ArrayList::new [i64] a)
+        (mut units) 0]
+    (for i (range 0 (len text))
+      (let [b (primitive/cast i64 (get text i))]
+        (when (!= (& b 0xC0) 0x80)
+          (push! (mut offsets) (load units))
+          (set! units (+ (load units) (if (>= b 0xF0) 2 1))))))
+    (push! (mut offsets) (load units))
+    (load offsets)))
+
+(defn locate [(a (dyn Allocator)) (text (slice u8)) (raw (ArrayList RawIssue))]
+  (-> Outcome)
+  (let [offsets (utf16-offsets a text)
+        last (- (len offsets) 1)
+        (mut issues) (ArrayList::new [Issue] a)
+        (mut bad) false]
+    (for r (iter raw)
+      (if (or (< (.start r) 0) (< (.end r) (.start r)) (> (.end r) last))
+          (set! bad true)
+          (push! (mut issues)
+                 (Issue
+                   :start (get offsets (.start r))
+                   :end (get offsets (.end r))
+                   :original (.original r)
+                   :suggestion (.suggestion r)
+                   :kind (.kind r)
+                   :explanation (.explanation r)))))
+    (if (load bad)
+        (failed "grammar reported a position outside the text" "")
+        (Found (load issues)))))
+
+;;; Write the text to a private temporary file and return its path.
+(defn write-temp [(a (dyn Allocator)) (text (slice u8))] (-> (Option (ptr i8)))
+  (let [dir
+          (let [t (os/getenv c"TMPDIR")]
+            (if (= t (primitive/cast (ptr i8) 0)) "/tmp/" (from-cstr t)))
+        sep
+          (if (and (> (len dir) 0)
+                   (= (primitive/cast i64 (get dir (- (len dir) 1))) #\/))
+              ""
+              "/")
+        template
+          (match (concat a dir sep)
+            (Some [prefix]
+                  (match (concat a prefix "grammar-app-XXXXXX")
+                    (Some [full] full)
+                    (None [] (panic "out of memory"))))
+            (None [] (panic "out of memory")))
+        path (to-cstr a template)
+        fd (mkstemp path)]
+    (if (< fd (: 0 i32))
+        (None)
+        (do
+          (os/close fd)
+          (match (fs/write-file a (from-cstr path) text)
+            (Ok [_] (Some path))
+            (Err [_] (do (unlink path) (None))))))))
+
+;;; Run `grammar --json` on the job's text and record the outcome in the job.
+;;; Runs on a worker thread; touches nothing but the job.
+(defn run-check! [(job (ptr Job))] (-> i64)
+  (let [a (job-allocator job)]
+    (set! (.outcome job)
+          (match (write-temp a (.text job))
+            (None []
+                  (failed "Couldn't write a temporary file for the checker." ""))
+            (Some [path]
+                  (let [(mut result) (zeroed sp/RunResult)
+                        grace
+                          (try (let [d
+                                       (try-or! (time/Duration::millis 500)
+                                                (panic "invalid duration"))]
+                                 d))
+                        deadline
+                          (try (let [d
+                                       (try-or! (time/Duration::seconds 600)
+                                                (panic "invalid duration"))]
+                                 (match (time/Instant::from-now d)
+                                   (Ok [instant] (Some instant))
+                                   (Err [_] (panic "invalid deadline")))))
+                        options
+                          (sp/RunOptions::new "grammar"
+                                              ["--json" (from-cstr path)]
+                                              ""
+                                              (* 16 1048576)
+                                              (* 1 1048576)
+                                              deadline
+                                              (primitive/cast (ptr cancellation/Cancellation)
+                                                              0)
+                                              grace)
+                        ran (sp/run a (mut result) options)]
+                    (unlink path)
+                    (match ran
+                      (Err [e]
+                           (match e
+                             (sp/SpawnFailed [_]
+                                             (failed "Couldn't start `grammar`. Is it on your PATH?"
+                                                     ""))
+                             (_ (failed "Running `grammar` failed." ""))))
+                      (Ok [r]
+                          (if (.timed-out r)
+                              (failed "The check took longer than 10 minutes and was stopped."
+                                      "")
+                              (match (.status r)
+                                (sp/Signaled [_]
+                                             (failed "`grammar` was killed by a signal."
+                                                     (.stderr r)))
+                                (sp/Exited [code]
+                                           (if (or (= code 0) (= code 1))
+                                               (try (let [raw
+                                                            (try-or! (from-json [(ArrayList RawIssue)]
+                                                                                a
+                                                                                (.stdout r))
+                                                                     (failed "Couldn't read the checker's output."
+                                                                             (.stdout r)))]
+                                                      (locate a (.text job) raw)))
+                                               (failed (first-line (.stderr r))
+                                                       (.stderr r))))))))))))
+    0))

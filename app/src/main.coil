@@ -1,0 +1,9 @@
+(module grammar-app)
+(import "grammar-app.objc" :use *)
+(import "grammar-app.ui" :use [launch! application])
+
+(defn main [] (-> i64)
+  (launch!)
+  (msg void (application) c"activateIgnoringOtherApps:" [i8] (: 1 i8))
+  (msg void (application) c"run" [])
+  0)

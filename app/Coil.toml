@@ -1,0 +1,7 @@
+[package]
+name = "grammar-app"
+entry = "src/main.coil"
+
+[link]
+frameworks = ["AppKit"]
+libs = ["objc"]

@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+"""grammar: check text for spelling, grammar, and punctuation errors.
+
+Runs the factory `grammar` agent in this repository and prints each error
+with its location. Correctness only: no style suggestions.
+
+    grammar notes.md            check a file
+    grammar a.md b.txt          check several
+    pbpaste | grammar           check stdin
+    grammar -s "Their it is."   check a string
+    grammar --fix notes.md      print the text with every fix applied
+    grammar -w notes.md         apply every fix in place
+    grammar --thorough notes.md slower, more careful model
+    grammar -m deepseek/deepseek-v4-flash notes.md   any provider/model
+
+Exit status: 0 no errors, 1 errors found, 2 the check itself failed.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+DEFAULT_MODEL = "chatgpt/gpt-6-luna"
+THOROUGH_MODEL = "deepseek/deepseek-v4-pro"
+CHUNK_CHARS = 2500
+CONCURRENCY = 6
+
+
+class CheckFailed(Exception):
+    pass
+
+
+def chunks(text):
+    """Split text at blank lines (never inside a code fence) into pieces of
+    about CHUNK_CHARS. Yields (offset, piece); the pieces concatenate to text."""
+    start = 0
+    pos = 0
+    in_fence = False
+    for line in text.splitlines(keepends=True):
+        if line.lstrip().startswith(("```", "~~~")):
+            in_fence = not in_fence
+        pos += len(line)
+        if not in_fence and line.strip() == "" and pos - start >= CHUNK_CHARS:
+            yield start, text[start:pos]
+            start = pos
+    if start < len(text):
+        yield start, text[start:]
+
+
+def run_agent(piece, model, harness):
+    if not piece.strip():
+        return []
+    command = ["factory", "agent", "run", "grammar", "--project", str(REPO), "--model", model]
+    if harness:
+        command += ["--harness", harness]
+    proc = subprocess.run(
+        command, input=piece, capture_output=True, text=True,
+    )
+    try:
+        result = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        raise CheckFailed(f"factory exited {proc.returncode}:\n{proc.stdout}{proc.stderr}")
+    if not result.get("ok"):
+        raise CheckFailed(result.get("failure") or proc.stderr or "the agent failed")
+    return [r["arguments"] for r in result["reports"]]
+
+
+def locate(piece, offset, reports):
+    """Turn reports into absolute (start, end) spans. The agent guarantees
+    context is verbatim in the piece and original is inside context. A context
+    that occurs more than once is the same error each time, so every
+    occurrence is marked."""
+    located = []
+    for r in reports:
+        inner = r["context"].find(r["original"])
+        if inner < 0:
+            raise CheckFailed(f"report original {r['original']!r} not in context {r['context']!r}")
+        at = piece.find(r["context"])
+        if at < 0:
+            raise CheckFailed(f"report context not found in input: {r['context']!r}")
+        while at >= 0:
+            start = offset + at + inner
+            located.append({**r, "start": start, "end": start + len(r["original"])})
+            at = piece.find(r["context"], at + 1)
+    return located
+
+
+def check(text, model, harness):
+    pieces = list(chunks(text))
+    with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
+        results = list(pool.map(lambda p: run_agent(p[1], model, harness), pieces))
+    issues = []
+    for (offset, piece), reports in zip(pieces, results):
+        issues.extend(locate(piece, offset, reports))
+    issues.sort(key=lambda i: i["start"])
+    # Two reports over the same characters cannot both be applied; keep the first.
+    kept, end = [], -1
+    for issue in issues:
+        if issue["start"] >= end:
+            kept.append(issue)
+            end = issue["end"]
+    return kept
+
+
+def apply_fixes(text, issues):
+    out, pos = [], 0
+    for issue in issues:
+        out.append(text[pos:issue["start"]])
+        out.append(issue["suggestion"])
+        pos = issue["end"]
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def line_col(text, index):
+    line = text.count("\n", 0, index) + 1
+    col = index - (text.rfind("\n", 0, index) + 1) + 1
+    return line, col
+
+
+class Style:
+    def __init__(self, enabled):
+        def code(c):
+            return (lambda s: f"\033[{c}m{s}\033[0m") if enabled else (lambda s: s)
+        self.dim, self.bold = code("2"), code("1")
+        self.red, self.green, self.yellow = code("31;9"), code("32;1"), code("33")
+        self.under = code("4;31")
+
+
+def print_report(name, text, issues, style):
+    for issue in issues:
+        line, col = line_col(text, issue["start"])
+        line_start = text.rfind("\n", 0, issue["start"]) + 1
+        line_end = text.find("\n", issue["start"])
+        if line_end < 0:
+            line_end = len(text)
+        s, e = issue["start"] - line_start, issue["end"] - line_start
+        source = text[line_start:line_end]
+        excerpt = source[:s] + style.under(source[s:e]) + source[e:]
+        print(f"{style.bold(f'{name}:{line}:{col}')}  {style.yellow(issue['kind'])}  "
+              f"{style.red(issue['original'])} → {style.green(issue['suggestion'])}  "
+              f"{style.dim(issue['explanation'])}")
+        print(f"    {excerpt.strip()}")
+        print()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="grammar", description="Check text for spelling, grammar, and punctuation errors (no style opinions).")
+    parser.add_argument("files", nargs="*", help="files to check (default: stdin)")
+    parser.add_argument("-s", "--string", help="check this text instead of files")
+    parser.add_argument("--fix", action="store_true", help="print the text with every fix applied")
+    parser.add_argument("-w", "--write", action="store_true", help="apply every fix to the files in place")
+    parser.add_argument("--json", action="store_true", help="print the errors as JSON")
+    parser.add_argument("-t", "--thorough", action="store_true",
+                        help=f"use {THOROUGH_MODEL} (slower, catches more) instead of {DEFAULT_MODEL}")
+    parser.add_argument("-m", "--model", help="use this provider/model (for --harness codex, the Codex model name)")
+    parser.add_argument("--harness", choices=["builtin", "opencode", "codex"],
+                        help="run the agent in this harness (default: builtin)")
+    args = parser.parse_args()
+
+    if args.write and (args.string is not None or not args.files):
+        parser.error("--write needs files")
+    if args.string is not None and args.files:
+        parser.error("give files or --string, not both")
+    if args.fix and len(args.files) > 1:
+        parser.error("--fix takes one input; use --write for several files")
+    if sum([args.fix, args.write, args.json]) > 1:
+        parser.error("--fix, --write, and --json are exclusive")
+
+    model = args.model or (THOROUGH_MODEL if args.thorough else DEFAULT_MODEL)
+    if args.string is not None:
+        inputs = [("<string>", None, args.string)]
+    elif args.files:
+        inputs = [(f, f, Path(f).read_bytes().decode("utf-8")) for f in args.files]
+    else:
+        inputs = [("<stdin>", None, sys.stdin.buffer.read().decode("utf-8"))]
+
+    style = Style(sys.stdout.isatty() and not os.environ.get("NO_COLOR"))
+    found = 0
+    all_json = []
+    for name, path, text in inputs:
+        if sys.stderr.isatty():
+            print(f"checking {name}…", file=sys.stderr)
+        try:
+            issues = check(text, model, args.harness)
+        except CheckFailed as e:
+            print(f"grammar: {name}: {e}", file=sys.stderr)
+            return 2
+        found += len(issues)
+        if args.json:
+            for issue in issues:
+                line, col = line_col(text, issue["start"])
+                all_json.append({"file": name, "line": line, "column": col, **issue})
+        elif args.fix:
+            sys.stdout.write(apply_fixes(text, issues))
+        elif args.write:
+            Path(path).write_bytes(apply_fixes(text, issues).encode("utf-8"))
+            print(f"{name}: fixed {len(issues)} error{'s' if len(issues) != 1 else ''}")
+        else:
+            print_report(name, text, issues, style)
+
+    if args.json:
+        print(json.dumps(all_json, indent=2))
+    elif not (args.fix or args.write):
+        print(style.green("no errors") if found == 0 else
+              style.bold(f"{found} error{'s' if found != 1 else ''}"))
+    return 1 if found and not (args.write or args.fix) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

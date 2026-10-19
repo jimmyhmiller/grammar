@@ -1,0 +1,104 @@
+(module grammar-app.objc)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use *)
+(import "coil.slice" :use *)
+(import "coil.str" :use [from-cstr])
+
+;;; The Objective-C runtime over plain C FFI: just enough to drive AppKit.
+
+(extern objc_getClass :cc c [(ptr i8)] (-> (ptr i8)))
+
+(extern sel_registerName :cc c [(ptr i8)] (-> (ptr i8)))
+
+(extern objc_msgSend :cc c [(ptr i8) (ptr i8)] (-> (ptr i8)))
+
+(extern objc_allocateClassPair :cc c [(ptr i8) (ptr i8) i64] (-> (ptr i8)))
+
+(extern objc_registerClassPair :cc c [(ptr i8)] (-> void))
+
+(extern class_addMethod :cc c [(ptr i8) (ptr i8) (ptr i8) (ptr i8)] (-> i8))
+
+(extern objc_autoreleasePoolPush :cc c [] (-> (ptr i8)))
+
+(extern objc_autoreleasePoolPop :cc c [(ptr i8)] (-> void))
+
+(defstruct NSRange [(location u64) (length u64)])
+
+(defstruct NSPoint [(x f64) (y f64)])
+
+(defstruct NSSize [(width f64) (height f64)])
+
+(defstruct NSRect [(x f64) (y f64) (width f64) (height f64)])
+
+;;; `(msg RET receiver c"selector:" [ARG-TYPES…] args…)` sends a message through
+;;; objc_msgSend cast to the exact C signature of the method.
+(defn msg [(ret Code) (recv Code) (selector Code) (argtypes Code) & (args Code)]
+  (-> Code)
+  `(primitive/call-ptr (primitive/cast (fnptr c
+                                              [(ptr i8) (ptr i8) ~@argtypes]
+                                              ~ret)
+                                       (primitive/fnptr-of objc_msgSend))
+                       ~recv
+                       (sel_registerName ~selector)
+                       ~@args))
+
+(defn nil [] (-> (ptr i8))
+  (primitive/cast (ptr i8) 0))
+
+(defn nil? [(p (ptr i8))] (-> bool)
+  (= p (nil)))
+
+(defn cls [(name (ptr i8))] (-> (ptr i8))
+  (let [c (objc_getClass name)]
+    (when (nil? c) (panic "Objective-C class not found"))
+    c))
+
+(defn sel [(name (ptr i8))] (-> (ptr i8))
+  (sel_registerName name))
+
+;;; `[[Class alloc] init]`, owned by the caller (+1).
+(defn new-object [(class-name (ptr i8))] (-> (ptr i8))
+  (msg (ptr i8) (msg (ptr i8) (cls class-name) c"alloc" []) c"init" []))
+
+;;; An autoreleased NSString from a C string literal.
+(defn ns-str-c [(s (ptr i8))] (-> (ptr i8))
+  (msg (ptr i8) (cls c"NSString") c"stringWithUTF8String:" [(ptr i8)] s))
+
+;;; An autoreleased NSString holding a copy of UTF-8 bytes.
+(defn ns-str [(s (slice u8))] (-> (ptr i8))
+  (let [obj (msg (ptr i8) (cls c"NSString") c"alloc" [])
+        str
+          (msg (ptr i8)
+               obj
+               c"initWithBytes:length:encoding:"
+               [(ptr u8) u64 u64]
+               (data s)
+               (primitive/cast u64 (len s))
+               4)]
+    (when (nil? str)
+      (panic "NSString initWithBytes failed: text is not valid UTF-8"))
+    (msg (ptr i8) str c"autorelease" [])))
+
+;;; An NSString's UTF-8 bytes, borrowed for as long as the string (and the current
+;;; autorelease pool) lives. Panics on strings with no UTF-8 form (lone surrogates).
+(defn str-bytes [(s (ptr i8))] (-> (slice u8))
+  (let [p (msg (ptr i8) s c"UTF8String" [])]
+    (when (nil? p) (panic "NSString has no UTF-8 representation"))
+    (from-cstr p)))
+
+(defn str-length [(s (ptr i8))] (-> u64)
+  (msg u64 s c"length" []))
+
+;;; The value of an AppKit `NSString *const` such as NSUnderlineStyleAttributeName.
+(defn appkit-constant [(address (ptr u8))] (-> (ptr i8))
+  (primitive/load (primitive/cast (ptr (ptr i8)) address)))
+
+;;; Add a method to a class being built. `imp` is a Coil function whose first two
+;;; parameters are `self` and `_cmd`; `types` is its Objective-C type encoding.
+(defn add-method! [(class (ptr i8))
+                   (selector (ptr i8))
+                   (imp (ptr i8))
+                   (types (ptr i8))] (-> i64)
+  (when (= (class_addMethod class (sel selector) imp types) (: 0 i8))
+    (panic "class_addMethod failed"))
+  0)

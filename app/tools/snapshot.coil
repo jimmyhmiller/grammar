@@ -1,0 +1,127 @@
+(module grammar-app.snapshot)
+(import "coil.primitive" :as primitive)
+(import "coil.str" :use [from-cstr])
+(import "grammar-app.objc" :use *)
+(import "grammar-app.check" :use *)
+(import "grammar-app.ui" :use *)
+
+;;; Development tool: drives the real window through a check and its fixes and
+;;; writes a PNG of the window at each step into DIR.
+;;;
+;;;     coil build tools/snapshot.coil && build/release/snapshot DIR
+
+(defn pump! [(seconds f64)] (-> i64)
+  (msg void
+       (msg (ptr i8) (cls c"NSRunLoop") c"currentRunLoop" [])
+       c"runUntilDate:"
+       [(ptr i8)]
+       (msg (ptr i8)
+            (cls c"NSDate")
+            c"dateWithTimeIntervalSinceNow:"
+            [f64]
+            seconds))
+  0)
+
+(defn snapshot! [(dir (ptr i8)) (name (ptr i8))] (-> i64)
+  (let [content
+          (msg (ptr i8)
+               (msg (ptr i8) (.window (app)) c"contentView" [])
+               c"superview"
+               [])
+        bounds (msg NSRect content c"bounds" [])
+        rep
+          (msg (ptr i8)
+               content
+               c"bitmapImageRepForCachingDisplayInRect:"
+               [NSRect]
+               bounds)
+        drawn
+          (do
+            (msg void
+                 content
+                 c"cacheDisplayInRect:toBitmapImageRep:"
+                 [NSRect (ptr i8)]
+                 bounds
+                 rep)
+            (nil))
+        png
+          (msg (ptr i8)
+               rep
+               c"representationUsingType:properties:"
+               [i64 (ptr i8)]
+               4
+               (msg (ptr i8) (cls c"NSDictionary") c"dictionary" []))
+        path (join (join (ns-str-c dir) (ns-str-c c"/")) (ns-str-c name))]
+    (when (= (msg i8 png c"writeToFile:atomically:" [(ptr i8) i8] path (: 1 i8))
+             (: 0 i8))
+      (panic "couldn't write the snapshot"))
+    (println "wrote {}  status: {}"
+             (str-bytes path)
+             (str-bytes (msg (ptr i8) (.status (app)) c"stringValue" [])))
+    0))
+
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (when (< argc (: 2 i32)) (panic "usage: snapshot DIR"))
+  (let [dir (primitive/load (index argv 1))
+        controller (do (launch!) (.controller (app)))
+        tv (.text-view (app))]
+    (msg void (application) c"finishLaunching" [])
+    (pump! 0.2)
+    (snapshot! dir c"1-empty.png")
+    (msg void
+         tv
+         c"setString:"
+         [(ptr i8)]
+         (ns-str "Their going to the café tomorrow 😀 and its going to be fun.\nI recieved the the tickets yesterday, but me and him was late."))
+    (pump! 0.1)
+    (msg void controller c"check:" [(ptr i8)] (nil))
+    (pump! 0.3)
+    (snapshot! dir c"2-checking.png")
+    (let [(mut waited) 0]
+      (while (and (.checking (app)) (< (load waited) 1200))
+        (pump! 0.1)
+        (set! waited (+ (load waited) 1))))
+    (when (.checking (app)) (panic "the check did not finish in 120 seconds"))
+    (snapshot! dir c"3-checked.png")
+    (for i (range 0 (issue-count))
+      (let [issue (issue-at i)]
+        (println "  issue {}: [{}..{}) {} -> {}"
+                 i
+                 (.start issue)
+                 (.end issue)
+                 (.original issue)
+                 (.suggestion issue))))
+    (when (> (issue-count) 1)
+      (let [second (issue-at 1)]
+        (msg void
+             tv
+             c"setSelectedRange:"
+             [NSRange]
+             (range-of (+ (.start second) 1) (+ (.start second) 1)))
+        (pump! 0.1)
+        (snapshot! dir c"4-caret-on-issue.png")
+        (msg void
+             (.window (app))
+             c"setContentSize:"
+             [NSSize]
+             (NSSize :width 440.0 :height 560.0))
+        (pump! 0.2)
+        (snapshot! dir c"5-narrow.png")
+        (msg void
+             (.window (app))
+             c"setContentSize:"
+             [NSSize]
+             (NSSize :width 760.0 :height 560.0))
+        (pump! 0.2)
+        ;; What clicking a correction does.
+        (apply-issue! 1)
+        (pump! 0.1)
+        (snapshot! dir c"6-fixed-one.png")))
+    (msg void controller c"fixAll:" [(ptr i8)] (nil))
+    (pump! 0.1)
+    (snapshot! dir c"7-fixed-all.png")
+    (println "text now: {}" (str-bytes (text-string)))
+    (msg void (msg (ptr i8) tv c"undoManager" []) c"undo" [])
+    (pump! 0.1)
+    (println "after one undo: {}" (str-bytes (text-string)))
+    0))

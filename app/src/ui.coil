@@ -1,0 +1,935 @@
+(module grammar-app.ui)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use *)
+(import "coil.arraylist" :use *)
+(import "coil.slice" :use *)
+(import "coil.thread" :use [Thread])
+(import "grammar-app.objc" :use *)
+(import "grammar-app.check" :use *)
+
+;;; Grammar: a minimal native macOS window around the `grammar` checker.
+;;; Type or paste text and press ⌘↩: every error is underlined with its
+;;; correction written just below it. Click a correction to apply it, or Fix All.
+;;; The status bar explains the error under the caret.
+
+(const WIDTH 760.0)
+
+(const HEIGHT 560.0)
+
+(const BAR 52.0)
+
+;; AppKit enum values used below.
+(const STYLE-WINDOW 15)  ; titled | closable | miniaturizable | resizable
+
+(const BACKING-BUFFERED 2)
+
+(const RESIZE-WIDTH 2)
+
+(const RESIZE-HEIGHT 16)
+
+(const MARGIN-LEFT 1)  ; NSViewMinXMargin
+
+(const MARGIN-RIGHT 4)  ; NSViewMaxXMargin
+
+(const MARGIN-TOP 32)  ; NSViewMaxYMargin
+
+(const UNDERLINE-THICK 2)
+
+(const TEXT-SIZE 15.0)
+
+(const SUGGESTION-SIZE 11.0)
+
+;; Room under each line for the corrections.
+(const LINE-SPACING 15.0)
+
+(const LINE-BREAK-TRUNCATE-TAIL 4)
+
+(const MODIFIER-SHIFT 131072)
+
+(const MODIFIER-OPTION 524288)
+
+(const MODIFIER-COMMAND 1048576)
+
+(defstruct App
+  [(window (ptr i8))
+   (text-view (ptr i8))
+   (status (ptr i8))
+   (spinner (ptr i8))
+   (check-button (ptr i8))
+   (fix-all-button (ptr i8))
+   (controller (ptr i8))
+   ;; The errors currently underlined, sorted by position, in UTF-16 offsets.
+   (issues (ArrayList Issue))
+   ;; The job whose arena holds the strings in `issues`.
+   (result (ptr Job))
+   ;; The check in flight, run by `worker`.
+   (pending (ptr Job))
+   (worker Thread)
+   (checking bool)
+   ;; The generation the last successful check ran on, or -1.
+   (checked-generation i64)
+   ;; The last check that failed, kept for its message.
+   (failure (ptr Job))
+   ;; A one-off message for the status bar, cleared by the next check.
+   (notice (slice u8))
+   ;; Bumped on every edit; a check's results apply only to its own generation.
+   (generation i64)
+   ;; Index into `issues` of the error under the caret, or -1.
+   (current i64)
+   ;; The correction labels drawn under the errors, one per issue.
+   (labels (ArrayList (ptr i8)))])
+
+(defn app [] (-> (ptr App))
+  (primitive/alloc-static App))
+
+(defn null-job [] (-> (ptr Job))
+  (primitive/cast (ptr Job) 0))
+
+(defn issue-count [] (-> i64)
+  (len (.issues (app))))
+
+(defn issue-at [(i i64)] (-> Issue)
+  (get (.issues (app)) i))
+
+;; ---- small AppKit helpers ----------------------------------------------------
+
+(defn range-of [(start i64) (end i64)] (-> NSRange)
+  (NSRange
+    :location (primitive/cast u64 start)
+    :length (primitive/cast u64 (- end start))))
+
+(defn rect [(x f64) (y f64) (w f64) (h f64)] (-> NSRect)
+  (NSRect
+    :x x
+    :y y
+    :width w
+    :height h))
+
+(defn frame-of [(view (ptr i8))] (-> NSRect)
+  (msg NSRect view c"frame" []))
+
+(defn set-frame! [(view (ptr i8)) (r NSRect)] (-> i64)
+  (msg void view c"setFrame:" [NSRect] r)
+  0)
+
+(defn set-hidden! [(view (ptr i8)) (hidden bool)] (-> i64)
+  (msg void view c"setHidden:" [i8] (if hidden (: 1 i8) (: 0 i8)))
+  0)
+
+(defn set-enabled! [(control (ptr i8)) (enabled bool)] (-> i64)
+  (msg void control c"setEnabled:" [i8] (if enabled (: 1 i8) (: 0 i8)))
+  0)
+
+(defn color [(name (ptr i8))] (-> (ptr i8))
+  (msg (ptr i8) (cls c"NSColor") name []))
+
+(defn system-font [(size f64)] (-> (ptr i8))
+  (msg (ptr i8) (cls c"NSFont") c"systemFontOfSize:" [f64] size))
+
+(defn join [(a (ptr i8)) (b (ptr i8))] (-> (ptr i8))
+  (msg (ptr i8) a c"stringByAppendingString:" [(ptr i8)] b))
+
+(defn int-string [(n i64)] (-> (ptr i8))
+  (msg (ptr i8)
+       (msg (ptr i8) (cls c"NSNumber") c"numberWithInteger:" [i64] n)
+       c"stringValue"
+       []))
+
+(defn text-string [] (-> (ptr i8))
+  (msg (ptr i8) (.text-view (app)) c"string" []))
+
+(defn underline-key [] (-> (ptr i8))
+  (appkit-constant (primitive/linker-address "NSUnderlineStyleAttributeName")))
+
+(defn underline-color-key [] (-> (ptr i8))
+  (appkit-constant (primitive/linker-address "NSUnderlineColorAttributeName")))
+
+;; ---- drawing the errors and the status bar -------------------------------------
+
+;;; Underline every error and write its correction below it. The underlines are
+;;; layout manager temporary attributes, so they never become part of the text.
+(defn render! [] (-> i64)
+  (let [lm (msg (ptr i8) (.text-view (app)) c"layoutManager" [])
+        everything (range-of 0 (primitive/cast i64 (str-length (text-string))))
+        red (color c"systemRedColor")
+        thick
+          (msg (ptr i8)
+               (cls c"NSNumber")
+               c"numberWithInteger:"
+               [i64]
+               UNDERLINE-THICK)]
+    (for key (iter [(underline-key) (underline-color-key)])
+      (msg void
+           lm
+           c"removeTemporaryAttribute:forCharacterRange:"
+           [(ptr i8) NSRange]
+           key
+           everything))
+    (for i (range 0 (issue-count))
+      (let [issue (issue-at i)
+            r (range-of (.start issue) (.end issue))]
+        (msg void
+             lm
+             c"addTemporaryAttribute:value:forCharacterRange:"
+             [(ptr i8) (ptr i8) NSRange]
+             (underline-key)
+             thick
+             r)
+        (msg void
+             lm
+             c"addTemporaryAttribute:value:forCharacterRange:"
+             [(ptr i8) (ptr i8) NSRange]
+             (underline-color-key)
+             red
+             r)))
+    (layout-suggestions!)))
+
+;;; A small green label showing an error's correction; clicking it applies it.
+(defn suggestion-label [(issue Issue) (i i64)] (-> (ptr i8))
+  (let [text
+          (if (= (len (.suggestion issue)) 0)
+              (ns-str-c c"(delete)")
+              (ns-str (.suggestion issue)))
+        label
+          (msg (ptr i8)
+               (cls c"NSTextField")
+               c"labelWithString:"
+               [(ptr i8)]
+               text)
+        click
+          (msg (ptr i8)
+               (msg (ptr i8) (cls c"NSClickGestureRecognizer") c"alloc" [])
+               c"initWithTarget:action:"
+               [(ptr i8) (ptr i8)]
+               (.controller (app))
+               (sel c"suggestionClicked:"))]
+    (msg void
+         label
+         c"setFont:"
+         [(ptr i8)]
+         (msg (ptr i8)
+              (cls c"NSFont")
+              c"systemFontOfSize:weight:"
+              [f64 f64]
+              SUGGESTION-SIZE
+              0.23))
+    (msg void label c"setTextColor:" [(ptr i8)] (color c"systemGreenColor"))
+    (msg void label c"setTag:" [i64] i)
+    (msg void label c"setToolTip:" [(ptr i8)] (ns-str (.explanation issue)))
+    (msg void label c"addGestureRecognizer:" [(ptr i8)] click)
+    (msg void click c"release" [])
+    (msg void label c"sizeToFit" [])
+    label))
+
+;;; Put each error's correction just under its first character, inside the text
+;;; view so it scrolls with the text. Corrections that would collide on one line
+;;; are pushed right.
+(defn layout-suggestions! [] (-> i64)
+  (let [state (app)
+        tv (.text-view state)
+        lm (msg (ptr i8) tv c"layoutManager" [])
+        origin (msg NSPoint tv c"textContainerOrigin" [])
+        line-height
+          (msg f64
+               lm
+               c"defaultLineHeightForFont:"
+               [(ptr i8)]
+               (system-font TEXT-SIZE))
+        length (primitive/cast i64 (str-length (text-string)))
+        labels (field state labels)
+        (mut row) -1.0
+        (mut right) 0.0]
+    ;; Old labels are autoreleased, not released: one of them may be the view
+    ;; whose click is being handled right now.
+    (for label (iter (load labels))
+      (msg void label c"removeFromSuperview" [])
+      (msg void label c"autorelease" []))
+    (clear! labels)
+    (when (> length 0)
+      (for i (range 0 (issue-count))
+        (let [issue (issue-at i)
+              at (if (< (.start issue) length) (.start issue) (- length 1))
+              glyph
+                (msg u64
+                     lm
+                     c"glyphIndexForCharacterAtIndex:"
+                     [u64]
+                     (primitive/cast u64 at))
+              line
+                (msg NSRect
+                     lm
+                     c"lineFragmentRectForGlyphAtIndex:effectiveRange:"
+                     [u64 (ptr i8)]
+                     glyph
+                     (nil))
+              spot (msg NSPoint lm c"locationForGlyphAtIndex:" [u64] glyph)
+              ;; A label draws its text 2pt in from its frame.
+              x (- (+ (.x origin) (+ (.x line) (.x spot))) 2.0)
+              y (+ (.y origin) (+ (.y line) line-height))
+              label (msg (ptr i8) (suggestion-label issue i) c"retain" [])
+              size (frame-of label)
+              placed-x
+                (if (and (= y (load row)) (< x (+ (load right) 6.0)))
+                    (+ (load right) 6.0)
+                    x)]
+          (set-frame! label (rect placed-x y (.width size) (.height size)))
+          (msg void tv c"addSubview:" [(ptr i8)] label)
+          (push! labels label)
+          (set! row y)
+          (set! right (+ placed-x (.width size))))))
+    0))
+
+(defn show-status! [(text (ptr i8)) (detail (ptr i8)) (failure bool)] (-> i64)
+  (let [label (.status (app))]
+    (msg void label c"setStringValue:" [(ptr i8)] text)
+    (msg void label c"setToolTip:" [(ptr i8)] detail)
+    (msg void
+         label
+         c"setTextColor:"
+         [(ptr i8)]
+         (if failure (color c"systemRedColor") (color c"secondaryLabelColor")))
+    0))
+
+(defn failure-job? [] (-> bool)
+  (!= (.failure (app)) (null-job)))
+
+;;; Bring the status bar and buttons in line with the current state.
+(defn refresh! [] (-> i64)
+  (let [state (app)
+        n (issue-count)
+        checking (.checking state)
+        current (.current state)]
+    (cond checking (show-status! (ns-str-c c"Checking…") (nil) false)
+          (failure-job?)
+            (match (.outcome (.failure state))
+              (Failed [message detail]
+                      (show-status! (ns-str message)
+                                    (if (= (len detail) 0)
+                                        (nil)
+                                        (ns-str detail))
+                                    true))
+              (Found [_] (panic "a successful check was recorded as a failure")))
+          (> (len (.notice state)) 0)
+            (show-status! (ns-str (.notice state)) (nil) false)
+          (>= current 0)
+            (let [issue (issue-at current)]
+              (show-status! (join (join (join (join (ns-str (.original issue))
+                                                    (ns-str-c c"  →  "))
+                                              (ns-str (.suggestion issue)))
+                                        (ns-str-c c"   ·   "))
+                                  (ns-str (.explanation issue)))
+                            (ns-str (.kind issue))
+                            false))
+          (> n 0)
+            (show-status! (join (int-string n)
+                                (if (= n 1)
+                                    (ns-str-c c" issue. Click the correction to apply it.")
+                                    (ns-str-c c" issues. Click a correction to apply it, or Fix All.")))
+                          (nil)
+                          false)
+          (= (.checked-generation state) (.generation state))
+            (show-status! (ns-str-c c"No issues found.") (nil) false)
+          (>= (.checked-generation state) 0)
+            (show-status! (ns-str-c c"Edited since the last check. Press ⌘↩ to check again.")
+                          (nil)
+                          false)
+          :else
+            (show-status! (ns-str-c c"Type or paste text, then press ⌘↩ to check.")
+                          (nil)
+                          false))
+    (set-enabled! (.check-button state) (not checking))
+    (set-hidden! (.fix-all-button state) (or checking (= n 0)))
+    (if checking
+        (msg void (.spinner state) c"startAnimation:" [(ptr i8)] (nil))
+        (msg void (.spinner state) c"stopAnimation:" [(ptr i8)] (nil)))
+    0))
+
+;;; Which error the caret (or a selection inside one error) is on.
+(defn find-current [] (-> i64)
+  (let [selection (msg NSRange (.text-view (app)) c"selectedRange" [])
+        lo (primitive/cast i64 (.location selection))
+        hi (+ lo (primitive/cast i64 (.length selection)))
+        (mut found) -1]
+    (for i (range 0 (issue-count))
+      (let [issue (issue-at i)]
+        (when (and (< (load found) 0)
+                   (>= lo (.start issue))
+                   (<= hi (.end issue)))
+          (set! found i))))
+    (load found)))
+
+(defn update-current! [] (-> i64)
+  (set! (.current (app)) (find-current))
+  (render!)
+  (refresh!))
+
+;; ---- editing ----------------------------------------------------------------------
+
+;;; Keep the errors in step with an edit replacing [loc, loc+removed) with
+;;; `inserted` UTF-16 units: errors the edit touches are dropped, later ones move.
+(defn track-edit! [(loc i64) (removed i64) (inserted i64)] (-> i64)
+  (let [issues (field (app) issues)
+        n (len (load issues))
+        delta (- inserted removed)
+        (mut kept) 0]
+    (for i (range 0 n)
+      (let [issue (get (load issues) i)
+            start (.start issue)
+            end (.end issue)
+            touched
+              (if (> removed 0)
+                  (and (< loc end) (> (+ loc removed) start))
+                  (and (> loc start) (< loc end)))]
+        (when (not touched)
+          (set! issues
+                (load kept)
+                (if (>= start (+ loc removed))
+                    (Issue
+                      :start (+ start delta)
+                      :end (+ end delta)
+                      :original (.original issue)
+                      :suggestion (.suggestion issue)
+                      :kind (.kind issue)
+                      :explanation (.explanation issue))
+                    issue))
+          (set! kept (+ (load kept) 1)))))
+    (while (> (len (load issues)) (load kept))
+      (pop! issues))
+    0))
+
+;;; Replace error `i` with its suggestion as an ordinary, undoable edit.
+(defn apply-issue! [(i i64)] (-> bool)
+  (let [tv (.text-view (app))
+        issue (issue-at i)
+        r (range-of (.start issue) (.end issue))
+        replacement (ns-str (.suggestion issue))]
+    (if (= (msg i8
+                tv
+                c"shouldChangeTextInRange:replacementString:"
+                [NSRange (ptr i8)]
+                r
+                replacement)
+           (: 0 i8))
+        false
+        (do
+          (msg void
+               (msg (ptr i8) tv c"textStorage" [])
+               c"replaceCharactersInRange:withString:"
+               [NSRange (ptr i8)]
+               r
+               replacement)
+          (msg void tv c"didChangeText" [])
+          true))))
+
+;; ---- checking ---------------------------------------------------------------------
+
+;;; Runs on the worker thread: check, then hand the job back to the main thread.
+(defn check-worker [(arg (ptr i8))] (-> (ptr i8))
+  (let [pool (objc_autoreleasePoolPush)]
+    (run-check! (primitive/cast (ptr Job) arg))
+    (msg void
+         (.controller (app))
+         c"performSelectorOnMainThread:withObject:waitUntilDone:"
+         [(ptr i8) (ptr i8) i8]
+         (sel c"checkFinished:")
+         (nil)
+         (: 0 i8))
+    (objc_autoreleasePoolPop pool)
+    (nil)))
+
+(defn blank? [(text (slice u8))] (-> bool)
+  (let [(mut blank) true]
+    (for i (range 0 (len text))
+      (let [b (primitive/cast i64 (get text i))]
+        (when (not (or (= b #\space) (= b #\newline) (= b #\tab) (= b #\return)))
+          (set! blank false))))
+    (load blank)))
+
+(defn clear-failure! [] (-> i64)
+  (when (failure-job?)
+    (job-free (.failure (app)))
+    (set! (.failure (app)) (null-job)))
+  0)
+
+(defn start-check! [] (-> i64)
+  (let [state (app)
+        text (str-bytes (text-string))]
+    (cond (.checking state) 0
+          (blank? text)
+            (do (set! (.notice state) "Nothing to check yet.") (refresh!))
+          :else
+            (let [job (job-new text (.generation state))]
+              (clear-failure!)
+              (set! (.notice state) "")
+              (set! (.pending state) job)
+              (set! (.checking state) true)
+              (when (!= (Thread::spawn (field state worker)
+                                       (fnptr-of check-worker)
+                                       (primitive/cast (ptr i8) job))
+                        (: 0 i32))
+                (panic "couldn't start the checker thread"))
+              (refresh!)))))
+
+;;; Back on the main thread with the finished job.
+(defn finish-check! [] (-> i64)
+  (let [state (app)
+        job (.pending state)]
+    (Thread::join (field state worker))
+    (set! (.pending state) (null-job))
+    (set! (.checking state) false)
+    (if (!= (.generation job) (.generation state))
+        (do
+          (job-free job)
+          (set! (.notice state)
+                "The text changed during the check. Press ⌘↩ to check again."))
+        (match (.outcome job)
+          (Failed [_ _] (set! (.failure state) job))
+          (Found [found]
+                 (let [issues (field state issues)]
+                   (clear! issues)
+                   (for issue (iter found) (push! issues issue))
+                   (when (!= (.result state) (null-job))
+                     (job-free (.result state)))
+                   (set! (.result state) job)
+                   (set! (.checked-generation state) (.generation state))))))
+    (update-current!)))
+
+;; ---- the controller: target, text view delegate, and app delegate ------------------
+
+(defn on-check [(self (ptr i8)) (cmd (ptr i8)) (sender (ptr i8))] (-> i64)
+  (start-check!))
+
+(defn on-check-finished [(self (ptr i8)) (cmd (ptr i8)) (object (ptr i8))]
+  (-> i64)
+  (finish-check!))
+
+(defn on-fix [(self (ptr i8)) (cmd (ptr i8)) (sender (ptr i8))] (-> i64)
+  (let [current (.current (app))]
+    (when (>= current 0) (apply-issue! current))
+    0))
+
+(defn on-fix-all [(self (ptr i8)) (cmd (ptr i8)) (sender (ptr i8))] (-> i64)
+  (let [undo (msg (ptr i8) (.text-view (app)) c"undoManager" [])
+        n (issue-count)]
+    (msg void undo c"beginUndoGrouping" [])
+    ;; Last to first, so each fix leaves the earlier offsets alone.
+    (for k (range 0 n)
+      (let [i (- (- n 1) k)]
+        (when (< i (issue-count)) (apply-issue! i))))
+    (msg void undo c"endUndoGrouping" [])
+    (msg void undo c"setActionName:" [(ptr i8)] (ns-str-c c"Fix All"))
+    (when (> n 0)
+      (set! (.notice (app)) "Fixed every issue.")
+      (refresh!))
+    0))
+
+(defn on-suggestion-clicked [(self (ptr i8))
+                             (cmd (ptr i8))
+                             (recognizer (ptr i8))] (-> i64)
+  (let [i (msg i64 (msg (ptr i8) recognizer c"view" []) c"tag" [])]
+    (when (< i (issue-count)) (apply-issue! i))
+    0))
+
+(defn on-layout-changed [(self (ptr i8)) (cmd (ptr i8)) (note (ptr i8))]
+  (-> i64)
+  (layout-suggestions!))
+
+(defn on-apply-suggestion [(self (ptr i8)) (cmd (ptr i8)) (item (ptr i8))]
+  (-> i64)
+  (let [i (msg i64 item c"tag" [])]
+    (when (< i (issue-count)) (apply-issue! i))
+    0))
+
+;;; textView:shouldChangeTextInRange:replacementString:
+(defn on-should-change [(self (ptr i8))
+                        (cmd (ptr i8))
+                        (tv (ptr i8))
+                        (r NSRange)
+                        (replacement (ptr i8))] (-> i8)
+  (when (not (nil? replacement))
+    (track-edit! (primitive/cast i64 (.location r))
+                 (primitive/cast i64 (.length r))
+                 (primitive/cast i64 (str-length replacement)))
+    (set! (.current (app)) -1)
+    (set! (.notice (app)) "")
+    (set! (.generation (app)) (+ (.generation (app)) 1)))
+  (: 1 i8))
+
+(export-c [on-should-change :as "grammar_app_should_change"])
+
+(defn on-text-did-change [(self (ptr i8)) (cmd (ptr i8)) (note (ptr i8))]
+  (-> i64)
+  (update-current!))
+
+(defn on-selection-change [(self (ptr i8)) (cmd (ptr i8)) (note (ptr i8))]
+  (-> i64)
+  (update-current!))
+
+(defn menu-item [(title (ptr i8)) (action (ptr i8)) (key (ptr i8))]
+  (-> (ptr i8))
+  (msg (ptr i8)
+       (msg (ptr i8)
+            (msg (ptr i8) (cls c"NSMenuItem") c"alloc" [])
+            c"initWithTitle:action:keyEquivalent:"
+            [(ptr i8) (ptr i8) (ptr i8)]
+            title
+            (if (nil? action) (nil) (sel action))
+            (ns-str-c key))
+       c"autorelease"
+       []))
+
+;;; textView:menu:forEvent:atIndex: — put the correction at the top of the
+;;; context menu of an underlined word.
+(defn on-context-menu [(self (ptr i8))
+                       (cmd (ptr i8))
+                       (tv (ptr i8))
+                       (menu (ptr i8))
+                       (event (ptr i8))
+                       (index u64)] (-> (ptr i8))
+  (let [at (primitive/cast i64 index)
+        (mut hit) -1]
+    (for i (range 0 (issue-count))
+      (let [issue (issue-at i)]
+        (when (and (< (load hit) 0) (>= at (.start issue)) (< at (.end issue)))
+          (set! hit i))))
+    (when (>= (load hit) 0)
+      (let [issue (issue-at (load hit))
+            change
+              (menu-item (join (join (ns-str-c c"Change to “")
+                                     (ns-str (.suggestion issue)))
+                               (ns-str-c c"”"))
+                         c"applySuggestion:"
+                         c"")
+            why
+              (menu-item (ns-str (.explanation issue))
+                         (primitive/cast (ptr i8) 0)
+                         c"")]
+        (msg void change c"setTarget:" [(ptr i8)] self)
+        (msg void change c"setTag:" [i64] (load hit))
+        (msg void why c"setEnabled:" [i8] (: 0 i8))
+        (msg void
+             menu
+             c"insertItem:atIndex:"
+             [(ptr i8) i64]
+             (msg (ptr i8) (cls c"NSMenuItem") c"separatorItem" [])
+             0)
+        (msg void menu c"insertItem:atIndex:" [(ptr i8) i64] why 0)
+        (msg void menu c"insertItem:atIndex:" [(ptr i8) i64] change 0)))
+    menu))
+
+(defn on-terminate-after-last-window [(self (ptr i8))
+                                      (cmd (ptr i8))
+                                      (application (ptr i8))] (-> i8)
+  (: 1 i8))
+
+(defn make-controller [] (-> (ptr i8))
+  (let [c (objc_allocateClassPair (cls c"NSObject") c"GrammarController" 0)]
+    (when (nil? c) (panic "couldn't create the GrammarController class"))
+    (add-method! c
+                 c"check:"
+                 (primitive/cast (ptr i8) (fnptr-of on-check))
+                 c"v@:@")
+    (add-method! c
+                 c"checkFinished:"
+                 (primitive/cast (ptr i8) (fnptr-of on-check-finished))
+                 c"v@:@")
+    (add-method! c c"fix:" (primitive/cast (ptr i8) (fnptr-of on-fix)) c"v@:@")
+    (add-method! c
+                 c"fixAll:"
+                 (primitive/cast (ptr i8) (fnptr-of on-fix-all))
+                 c"v@:@")
+    (add-method! c
+                 c"suggestionClicked:"
+                 (primitive/cast (ptr i8) (fnptr-of on-suggestion-clicked))
+                 c"v@:@")
+    (add-method! c
+                 c"layoutChanged:"
+                 (primitive/cast (ptr i8) (fnptr-of on-layout-changed))
+                 c"v@:@")
+    (add-method! c
+                 c"applySuggestion:"
+                 (primitive/cast (ptr i8) (fnptr-of on-apply-suggestion))
+                 c"v@:@")
+    (add-method! c
+                 c"textView:shouldChangeTextInRange:replacementString:"
+                 (primitive/cast (ptr i8) (fnptr-of on-should-change))
+                 c"c@:@{_NSRange=QQ}@")
+    (add-method! c
+                 c"textDidChange:"
+                 (primitive/cast (ptr i8) (fnptr-of on-text-did-change))
+                 c"v@:@")
+    (add-method! c
+                 c"textViewDidChangeSelection:"
+                 (primitive/cast (ptr i8) (fnptr-of on-selection-change))
+                 c"v@:@")
+    (add-method! c
+                 c"textView:menu:forEvent:atIndex:"
+                 (primitive/cast (ptr i8) (fnptr-of on-context-menu))
+                 c"@@:@@@Q")
+    (add-method! c
+                 c"applicationShouldTerminateAfterLastWindowClosed:"
+                 (primitive/cast (ptr i8)
+                                 (fnptr-of on-terminate-after-last-window))
+                 c"c@:@")
+    (objc_registerClassPair c)
+    (new-object c"GrammarController")))
+
+;; ---- building the window and menus ---------------------------------------------
+
+(defn add-item! [(menu (ptr i8))
+                 (title (ptr i8))
+                 (action (ptr i8))
+                 (key (ptr i8))
+                 (modifiers i64)
+                 (target (ptr i8))] (-> i64)
+  (let [item (menu-item (ns-str-c title) action key)]
+    (when (!= modifiers 0)
+      (msg void item c"setKeyEquivalentModifierMask:" [i64] modifiers))
+    (when (not (nil? target))
+      (msg void item c"setTarget:" [(ptr i8)] target))
+    (msg void menu c"addItem:" [(ptr i8)] item)
+    0))
+
+(defn add-separator! [(menu (ptr i8))] (-> i64)
+  (msg void
+       menu
+       c"addItem:"
+       [(ptr i8)]
+       (msg (ptr i8) (cls c"NSMenuItem") c"separatorItem" []))
+  0)
+
+(defn submenu! [(bar (ptr i8)) (title (ptr i8))] (-> (ptr i8))
+  (let [holder (menu-item (ns-str-c title) (nil) c"")
+        menu
+          (msg (ptr i8)
+               (msg (ptr i8) (cls c"NSMenu") c"alloc" [])
+               c"initWithTitle:"
+               [(ptr i8)]
+               (ns-str-c title))]
+    (msg void holder c"setSubmenu:" [(ptr i8)] menu)
+    (msg void bar c"addItem:" [(ptr i8)] holder)
+    menu))
+
+(defn build-menus! [(application (ptr i8)) (controller (ptr i8))] (-> i64)
+  (let [bar (new-object c"NSMenu")
+        app-menu (submenu! bar c"Grammar")
+        edit (submenu! bar c"Edit")
+        check (submenu! bar c"Check")
+        window (submenu! bar c"Window")]
+    (add-item! app-menu c"Hide Grammar" c"hide:" c"h" 0 (nil))
+    (add-item! app-menu
+               c"Hide Others"
+               c"hideOtherApplications:"
+               c"h"
+               (+ MODIFIER-COMMAND MODIFIER-OPTION)
+               (nil))
+    (add-item! app-menu c"Show All" c"unhideAllApplications:" c"" 0 (nil))
+    (add-separator! app-menu)
+    (add-item! app-menu c"Quit Grammar" c"terminate:" c"q" 0 (nil))
+    (add-item! edit c"Undo" c"undo:" c"z" 0 (nil))
+    (add-item! edit
+               c"Redo"
+               c"redo:"
+               c"z"
+               (+ MODIFIER-COMMAND MODIFIER-SHIFT)
+               (nil))
+    (add-separator! edit)
+    (add-item! edit c"Cut" c"cut:" c"x" 0 (nil))
+    (add-item! edit c"Copy" c"copy:" c"c" 0 (nil))
+    (add-item! edit c"Paste" c"paste:" c"v" 0 (nil))
+    (add-item! edit c"Select All" c"selectAll:" c"a" 0 (nil))
+    (add-item! check c"Check Text" c"check:" c"\xd;" 0 controller)
+    (add-item! check c"Fix" c"fix:" c"" 0 controller)
+    (add-item! check
+               c"Fix All"
+               c"fixAll:"
+               c"\xd;"
+               (+ MODIFIER-COMMAND MODIFIER-SHIFT)
+               controller)
+    (add-item! window c"Minimize" c"performMiniaturize:" c"m" 0 (nil))
+    (add-item! window c"Close" c"performClose:" c"w" 0 (nil))
+    (msg void application c"setMainMenu:" [(ptr i8)] bar)
+    (msg void application c"setWindowsMenu:" [(ptr i8)] window)
+    0))
+
+(defn make-button [(title (ptr i8)) (action (ptr i8)) (controller (ptr i8))]
+  (-> (ptr i8))
+  (let [button
+          (msg (ptr i8)
+               (cls c"NSButton")
+               c"buttonWithTitle:target:action:"
+               [(ptr i8) (ptr i8) (ptr i8)]
+               (ns-str-c title)
+               controller
+               (sel action))]
+    (msg void button c"sizeToFit" [])
+    (msg void button c"setAutoresizingMask:" [i64] (+ MARGIN-LEFT MARGIN-TOP))
+    button))
+
+;;; Place `view` with its right edge at `right`, centred in the status bar;
+;;; returns its left edge.
+(defn place-right! [(view (ptr i8)) (right f64)] (-> f64)
+  (let [f (frame-of view)
+        x (- right (.width f))]
+    (set-frame! view
+                (rect x (/ (- BAR (.height f)) 2.0) (.width f) (.height f)))
+    x))
+
+(defn build-window! [(controller (ptr i8))] (-> i64)
+  (let [state (app)
+        window
+          (msg (ptr i8)
+               (msg (ptr i8) (cls c"NSWindow") c"alloc" [])
+               c"initWithContentRect:styleMask:backing:defer:"
+               [NSRect i64 i64 i8]
+               (rect 0.0 0.0 WIDTH HEIGHT)
+               STYLE-WINDOW
+               BACKING-BUFFERED
+               (: 0 i8))
+        content (msg (ptr i8) window c"contentView" [])
+        scroll (msg (ptr i8) (cls c"NSTextView") c"scrollableTextView" [])
+        tv (msg (ptr i8) scroll c"documentView" [])
+        separator (new-object c"NSBox")
+        status
+          (msg (ptr i8)
+               (cls c"NSTextField")
+               c"labelWithString:"
+               [(ptr i8)]
+               (ns-str-c c""))
+        spinner (new-object c"NSProgressIndicator")
+        check (make-button c"Check" c"check:" controller)
+        fix-all (make-button c"Fix All" c"fixAll:" controller)
+        style
+          (msg (ptr i8)
+               (new-object c"NSMutableParagraphStyle")
+               c"autorelease"
+               [])
+        typing (msg (ptr i8) (cls c"NSMutableDictionary") c"dictionary" [])]
+    (msg void window c"setTitle:" [(ptr i8)] (ns-str-c c"Grammar"))
+    (msg void
+         window
+         c"setMinSize:"
+         [NSSize]
+         (NSSize :width 420.0 :height 300.0))
+    (msg void window c"setReleasedWhenClosed:" [i8] (: 0 i8))
+    (msg void window c"center" [])
+    (msg i8
+         window
+         c"setFrameAutosaveName:"
+         [(ptr i8)]
+         (ns-str-c c"GrammarMainWindow"))
+
+    ;; The text: plain, roomy, and free of AppKit's own spelling and grammar marks.
+    (set-frame! scroll (rect 0.0 (+ BAR 1.0) WIDTH (- HEIGHT (+ BAR 1.0))))
+    (msg void
+         scroll
+         c"setAutoresizingMask:"
+         [i64]
+         (+ RESIZE-WIDTH RESIZE-HEIGHT))
+    (msg void scroll c"setBorderType:" [i64] 0)
+    (msg void tv c"setRichText:" [i8] (: 0 i8))
+    (msg void tv c"setFont:" [(ptr i8)] (system-font TEXT-SIZE))
+    (msg void style c"setLineSpacing:" [f64] LINE-SPACING)
+    (msg void tv c"setDefaultParagraphStyle:" [(ptr i8)] style)
+    (msg void
+         typing
+         c"setObject:forKey:"
+         [(ptr i8) (ptr i8)]
+         (system-font TEXT-SIZE)
+         (appkit-constant (primitive/linker-address "NSFontAttributeName")))
+    (msg void
+         typing
+         c"setObject:forKey:"
+         [(ptr i8) (ptr i8)]
+         style
+         (appkit-constant (primitive/linker-address "NSParagraphStyleAttributeName")))
+    (msg void
+         typing
+         c"setObject:forKey:"
+         [(ptr i8) (ptr i8)]
+         (color c"textColor")
+         (appkit-constant (primitive/linker-address "NSForegroundColorAttributeName")))
+    (msg void tv c"setTypingAttributes:" [(ptr i8)] typing)
+    (msg void
+         tv
+         c"setTextContainerInset:"
+         [NSSize]
+         (NSSize :width 28.0 :height 24.0))
+    (msg void tv c"setAllowsUndo:" [i8] (: 1 i8))
+    (msg void tv c"setContinuousSpellCheckingEnabled:" [i8] (: 0 i8))
+    (msg void tv c"setGrammarCheckingEnabled:" [i8] (: 0 i8))
+    (msg void tv c"setAutomaticSpellingCorrectionEnabled:" [i8] (: 0 i8))
+    (msg void tv c"setAutomaticQuoteSubstitutionEnabled:" [i8] (: 0 i8))
+    (msg void tv c"setAutomaticDashSubstitutionEnabled:" [i8] (: 0 i8))
+    (msg void tv c"setAutomaticTextReplacementEnabled:" [i8] (: 0 i8))
+    (msg void tv c"setDelegate:" [(ptr i8)] controller)
+
+    ;; The status bar: a hairline, a message, and the buttons on the right.
+    (msg void separator c"setBoxType:" [i64] 2)
+    (set-frame! separator (rect 0.0 BAR WIDTH 1.0))
+    (msg void
+         separator
+         c"setAutoresizingMask:"
+         [i64]
+         (+ RESIZE-WIDTH MARGIN-TOP))
+    (msg void spinner c"setStyle:" [i64] 1)
+    (msg void spinner c"setControlSize:" [i64] 1)
+    (msg void spinner c"setDisplayedWhenStopped:" [i8] (: 0 i8))
+    (msg void spinner c"setAutoresizingMask:" [i64] (+ MARGIN-LEFT MARGIN-TOP))
+    (let [check-x (place-right! check (- WIDTH 16.0))
+          fix-all-x (place-right! fix-all (- check-x 4.0))]
+      (set-frame! spinner
+                  (rect (- check-x 26.0) (/ (- BAR 16.0) 2.0) 16.0 16.0))
+      (set-frame! status
+                  (rect 20.0 (/ (- BAR 18.0) 2.0) (- fix-all-x 32.0) 18.0)))
+    (msg void status c"setFont:" [(ptr i8)] (system-font 13.0))
+    (msg void status c"setLineBreakMode:" [i64] LINE-BREAK-TRUNCATE-TAIL)
+    (msg void status c"setAutoresizingMask:" [i64] (+ RESIZE-WIDTH MARGIN-TOP))
+
+    (for view (iter [scroll separator status spinner fix-all check])
+      (msg void content c"addSubview:" [(ptr i8)] view))
+
+    (set! (.window state) window)
+    (set! (.text-view state) tv)
+    (set! (.status state) status)
+    (set! (.spinner state) spinner)
+    (set! (.check-button state) check)
+    (set! (.fix-all-button state) fix-all)
+    ;; Corrections sit at fixed spots in the text, so move them when it reflows.
+    (msg void
+         (msg (ptr i8) (cls c"NSNotificationCenter") c"defaultCenter" [])
+         c"addObserver:selector:name:object:"
+         [(ptr i8) (ptr i8) (ptr i8) (ptr i8)]
+         controller
+         (sel c"layoutChanged:")
+         (appkit-constant (primitive/linker-address "NSWindowDidResizeNotification"))
+         window)
+    (msg void window c"makeKeyAndOrderFront:" [(ptr i8)] (nil))
+    (msg i8 window c"makeFirstResponder:" [(ptr i8)] tv)
+    0))
+
+(defn application [] (-> (ptr i8))
+  (msg (ptr i8) (cls c"NSApplication") c"sharedApplication" []))
+
+;;; Create the app's controller, menus, and window. The caller runs the app.
+(defn launch! [] (-> i64)
+  (let [pool (objc_autoreleasePoolPush)
+        application (application)
+        controller (make-controller)
+        state (app)]
+    (set! (.issues state) (ArrayList::new [Issue] (malloc-allocator)))
+    (set! (.result state) (null-job))
+    (set! (.pending state) (null-job))
+    (set! (.failure state) (null-job))
+    (set! (.notice state) "")
+    (set! (.current state) -1)
+    (set! (.checked-generation state) -1)
+    (set! (.labels state) (ArrayList::new [(ptr i8)] (malloc-allocator)))
+    (set! (.controller state) controller)
+    (msg void application c"setActivationPolicy:" [i64] 0)
+    (msg void application c"setDelegate:" [(ptr i8)] controller)
+    (build-menus! application controller)
+    (build-window! controller)
+    (refresh!)
+    (objc_autoreleasePoolPop pool)
+    0))
